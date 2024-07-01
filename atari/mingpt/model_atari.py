@@ -74,9 +74,17 @@ class CausalSelfAttention(nn.Module):
         #                              .view(1, 1, config.block_size, config.block_size))
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size + 1, config.block_size + 1))
                                      .view(1, 1, config.block_size + 1, config.block_size + 1))
+        
+        # self.register_buffer("mask", (1 - torch.tril(torch.ones(config.block_size + 1, config.block_size + 1)))
+        #                              .view(1, 1, config.block_size + 1, config.block_size + 1).transpose(2,3))
         self.n_head = config.n_head
 
+        print(config.n_embd, config.block_size)
+
     def forward(self, x, layer_past=None):
+        # print(x.size())
+        # print(self.n_head, self.mask.shape)
+        # exit()
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -127,8 +135,7 @@ class GPT(nn.Module):
         self.model_type = config.model_type
 
         # input embedding stem
-        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        # self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
+
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size + 1, config.n_embd))
         self.global_pos_emb = nn.Parameter(torch.zeros(1, config.max_timestep+1, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
@@ -137,7 +144,16 @@ class GPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         # decoder head
         self.ln_f = nn.LayerNorm(config.n_embd)
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        self.head = nn.Sequential(
+            # nn.LayerNorm(config.n_emb),
+            nn.Dropout(config.resid_pdrop),
+            nn.Linear(config.n_embd, config.vocab_size),
+            # nn.Tanh() 
+        )
+
+        self.pred_rating = nn.Linear(config.n_embd, 1, bias=False)
 
         self.block_size = config.block_size
         self.apply(self._init_weights)
@@ -145,16 +161,18 @@ class GPT(nn.Module):
 
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
 
-
-        self.state_encoder = nn.Sequential(nn.Conv2d(4, 32, 8, stride=4, padding=0), nn.ReLU(),
-                                 nn.Conv2d(32, 64, 4, stride=2, padding=0), nn.ReLU(),
-                                 nn.Conv2d(64, 64, 3, stride=1, padding=0), nn.ReLU(),
-                                 nn.Flatten(), nn.Linear(3136, config.n_embd), nn.Tanh())
-
+        # self.pos_emb = nn.Embedding(config.max_timestep, config.n_embd)
         self.ret_emb = nn.Sequential(nn.Linear(1, config.n_embd), nn.Tanh())
 
+        # self.action_embeddings = nn.Sequential(nn.Embedding(config.vocab_size, config.n_embd), nn.Linear(config.n_embd, config.n_embd, bias=False), nn.Tanh())
         self.action_embeddings = nn.Sequential(nn.Embedding(config.vocab_size, config.n_embd), nn.Tanh())
+
+        self.state_pred = nn.Sequential(nn.Linear(config.n_embd, config.n_embd, bias=False), nn.Tanh())
+
         nn.init.normal_(self.action_embeddings[0].weight, mean=0.0, std=0.02)
+
+        # self.predict_return = torch.nn.Linear(config.n_embd, 1)
+
 
     def get_block_size(self):
         return self.block_size
@@ -217,42 +235,89 @@ class GPT(nn.Module):
         return optimizer
 
     # state, action, and return
-    def forward(self, states, actions, targets=None, rtgs=None, timesteps=None):
+    # def forward(self, actions, targets=None, ratings=None, timesteps=None, attention=None):
+    #     # states: (batch, block_size, 4*84*84)
+    #     # actions: (batch, block_size, 1)
+    #     # targets: (batch, block_size, 1)
+    #     # rtgs: (batch, block_size, 1)
+    #     # timesteps: (batch, block_size, 1)
+
+
+    #     # print(actions.shape, timesteps.shape)
+    #     B, T = actions.size()
+    #     rating_embeddings = self.ret_emb(ratings.type(torch.float32))
+    #     action_embeddings = self.action_embeddings(actions.type(torch.long).squeeze(-1)) # (batch, block_size, n_embd)
+    #     time_embeddings = self.pos_emb(timesteps.type(torch.long).squeeze(-1))
+
+    #     action_embeddings = action_embeddings + time_embeddings
+    #     rating_embeddings = rating_embeddings + time_embeddings
+
+
+    #     token_embeddings = torch.zeros((B, T*2 , self.config.n_embd), dtype=torch.float32, device=action_embeddings.device)
+
+
+    #     # token_embeddings[:,::2,:] = action_embeddings # really just [:,0,:]
+    #     # token_embeddings[:,1::2,:] = rating_embeddings # really just [:,1,:]
+
+    #     # tout = self.drop(token_embeddings)
+    #     # x = self.blocks(tout)
+    #     # x = self.ln_f(x)
+    #     # # logits = self.head(x)
+
+    #     # # acts = x[:, ::2, :]
+    #     # preds = self.pred_rating(x[:,1::2,:])
+
+    #     # loss = torch.mean((ratings.reshape(-1) - preds.reshape(-1))**2)
+
+
+    #     token_embeddings[:,::2,:] = rating_embeddings # really just [:,0,:]
+    #     token_embeddings[:,1::2,:] = action_embeddings # really just [:,1,:]
+
+    #     tout = self.drop(token_embeddings)
+    #     x = self.blocks(tout)
+    #     x = self.ln_f(x)
+    #     preds = self.head(x[:, ::2, :])
+
+    #     loss = None 
+    #     if targets is not None:
+    #         loss = F.cross_entropy(preds.reshape(-1, preds.size(-1)), targets.reshape(-1), ignore_index=-1, size_average=True)
+
+    #     # if actions is not None and self.model_type == 'reward_conditioned':
+    #     #     logits = logits[:, 1::3, :] # only keep predictions from state_embeddings
+    #     # elif actions is None and self.model_type == 'reward_conditioned':
+    #     #     logits = logits[:, 1:, :]
+    #     # elif actions is not None and self.model_type == 'naive':
+    #     #     logits = logits[:, ::2, :] # only keep predictions from state_embeddings
+    #     # elif actions is None and self.model_type == 'naive':
+    #     #     logits = logits # for completeness
+    #     # else:
+    #     #     raise NotImplementedError()
+
+
+    #     return preds, loss
+    
+
+    def forward(self, actions, targets=None, ratings=None, timesteps=None, attention=None):
         # states: (batch, block_size, 4*84*84)
         # actions: (batch, block_size, 1)
         # targets: (batch, block_size, 1)
         # rtgs: (batch, block_size, 1)
         # timesteps: (batch, 1, 1)
 
-        state_embeddings = self.state_encoder(states.reshape(-1, 4, 84, 84).type(torch.float32).contiguous()) # (batch * block_size, n_embd)
-        state_embeddings = state_embeddings.reshape(states.shape[0], states.shape[1], self.config.n_embd) # (batch, block_size, n_embd)
+        batch_size, token_len = actions.size()
+        rating_embeddings = self.ret_emb(ratings.type(torch.float32))
+        action_embeddings = self.action_embeddings(actions.type(torch.long).squeeze(-1)) # (batch, block_size, n_embd)
+        # time_embeddings = self.pos_emb(timesteps.type(torch.long).squeeze(-1))
+
+        # action_embeddings = action_embeddings + time_embeddings
+        # rating_embeddings = rating_embeddings + time_embeddings
+
+
+        token_embeddings = torch.zeros((batch_size, token_len*2 , self.config.n_embd), dtype=torch.float32, device=action_embeddings.device)
+
+        token_embeddings[:,::2,:] = rating_embeddings # really just [:,0,:]
+        token_embeddings[:,1::2,:] = action_embeddings # really just [:,1,:]
         
-        if actions is not None and self.model_type == 'reward_conditioned': 
-            rtg_embeddings = self.ret_emb(rtgs.type(torch.float32))
-            action_embeddings = self.action_embeddings(actions.type(torch.long).squeeze(-1)) # (batch, block_size, n_embd)
-
-            token_embeddings = torch.zeros((states.shape[0], states.shape[1]*3 - int(targets is None), self.config.n_embd), dtype=torch.float32, device=state_embeddings.device)
-            token_embeddings[:,::3,:] = rtg_embeddings
-            token_embeddings[:,1::3,:] = state_embeddings
-            token_embeddings[:,2::3,:] = action_embeddings[:,-states.shape[1] + int(targets is None):,:]
-        elif actions is None and self.model_type == 'reward_conditioned': # only happens at very first timestep of evaluation
-            rtg_embeddings = self.ret_emb(rtgs.type(torch.float32))
-
-            token_embeddings = torch.zeros((states.shape[0], states.shape[1]*2, self.config.n_embd), dtype=torch.float32, device=state_embeddings.device)
-            token_embeddings[:,::2,:] = rtg_embeddings # really just [:,0,:]
-            token_embeddings[:,1::2,:] = state_embeddings # really just [:,1,:]
-        elif actions is not None and self.model_type == 'naive':
-            action_embeddings = self.action_embeddings(actions.type(torch.long).squeeze(-1)) # (batch, block_size, n_embd)
-
-            token_embeddings = torch.zeros((states.shape[0], states.shape[1]*2 - int(targets is None), self.config.n_embd), dtype=torch.float32, device=state_embeddings.device)
-            token_embeddings[:,::2,:] = state_embeddings
-            token_embeddings[:,1::2,:] = action_embeddings[:,-states.shape[1] + int(targets is None):,:]
-        elif actions is None and self.model_type == 'naive': # only happens at very first timestep of evaluation
-            token_embeddings = state_embeddings
-        else:
-            raise NotImplementedError()
-
-        batch_size = states.shape[0]
         all_global_pos_emb = torch.repeat_interleave(self.global_pos_emb, batch_size, dim=0) # batch_size, traj_length, n_embd
 
         position_embeddings = torch.gather(all_global_pos_emb, 1, torch.repeat_interleave(timesteps, self.config.n_embd, dim=-1)) + self.pos_emb[:, :token_embeddings.shape[1], :]
@@ -260,22 +325,57 @@ class GPT(nn.Module):
         x = self.drop(token_embeddings + position_embeddings)
         x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.head(x)
 
-        if actions is not None and self.model_type == 'reward_conditioned':
-            logits = logits[:, 1::3, :] # only keep predictions from state_embeddings
-        elif actions is None and self.model_type == 'reward_conditioned':
-            logits = logits[:, 1:, :]
-        elif actions is not None and self.model_type == 'naive':
-            logits = logits[:, ::2, :] # only keep predictions from state_embeddings
-        elif actions is None and self.model_type == 'naive':
-            logits = logits # for completeness
-        else:
-            raise NotImplementedError()
+        state_embd = self.state_pred(x[:, 1::2, :])
+        # print(state_embd.shape, action_embeddings.shape)
 
-        # if we are given some desired targets also calculate the loss
+        actions_preds = self.head(x[:, ::2, :])
+
         loss = None
+        rating_loss = None
+        action_loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            # loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            # pred_loss = torch.mean((pred_returns - rtgs)**2)
 
-        return logits, loss
+            # pred = torch.sum(state_embd[:, :-1, :] * action_embeddings[:, 1:, :], dim=-1)
+            # print(pred.shape, ratings.shape)
+            rating_loss = torch.mean(( torch.sum(state_embd[:, :-1, :] * action_embeddings[:, 1:, :], dim=-1) - torch.squeeze(ratings[:, 1:, :]))**2) 
+            action_loss = F.cross_entropy(actions_preds.reshape(-1, actions_preds.size(-1)), targets.reshape(-1), ignore_index=-1, size_average=True) #+ torch.mean((pred_returns - rtgs)**2)
+
+            # loss = action_loss + rating_loss
+
+            # actions_true = F.one_hot(targets, num_classes=self.config.vocab_size)
+            # loss = torch.mean((logits - actions_true)**2)
+        # print(logits.shape, actions.shape)
+
+        return actions_preds, action_loss, rating_loss
+    
+    def get_action(self, actions, ratings=None, timesteps=None, attention=None, device='cpu'):
+        # we don't care about the past rewards in this model
+        # print(actions)
+        # print(returns_to_go)
+
+        with torch.no_grad():
+            actions = torch.from_numpy(np.array(actions).reshape(1, -1)).long().to(device)
+            ratings = torch.from_numpy(np.array(ratings).reshape(1, -1, 1)).float().to(device)
+            # timesteps = torch.from_numpy(np.array(timesteps).reshape(1, -1)).long().to(device)
+
+            timesteps = torch.from_numpy(np.array(timesteps).reshape(1, -1, 1)).long().to(device)
+            # mask = torch.ones(ratings.shape[1]).reshape(1, -1).long().to(device)
+            action_preds , _ , _ = self.forward(
+                actions=actions,
+                targets=None,
+                ratings=ratings,
+                timesteps=timesteps,
+                attention=None
+            )
+
+
+        
+        # print(action_preds.shape)
+        # exit()
+        return action_preds
+    
+
+    
